@@ -1,68 +1,84 @@
-import logging
-from uuid import uuid4
-from llama_index.core.node_parser import SentenceSplitter
+"""
+graphdb/ingest.py
+Full ingestion pipeline:
+  extract → chunk → graph extract → store → community detection → store summaries
+"""
 
-from graphdb.model import graphdb
+import logging
+
 from backend.extract import extract
+from backend.chunker import chunk_documents
+from graphdb.graph_extract import extract_graph_from_chunks
+from graphdb.community import run_community_detection
+from graphdb.model import graphdb
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
 
 
-def ingest_file(file_path: str):
-    logger.info(f"[INGEST] Starting ingestion of: {file_path}")
+def ingest_file(
+    file_path: str,
+    extract_model: str = "phi3-small-ctx",
+    summary_model: str = "qwen3-small-ctx",
+    chunk_size: int = 300,
+    chunk_overlap: int = 50,
+) -> str:
+    """
+    Full ingestion pipeline for a single file.
+    
+    Returns: doc_id of the first document chunk
+    """
+    logger.info("=" * 60)
+    logger.info(f"[INGEST] Starting: {file_path}")
+    logger.info("=" * 60)
 
-    try:
-        doc_id = str(uuid4())
-        logger.info(f"[INGEST] Generated doc_id: {doc_id}")
+    # 1. Extract raw text
+    logger.info("[INGEST] Step 1: Extracting text...")
+    docs = extract(file_path)
+    if not docs:
+        raise ValueError("Extraction returned nothing")
+    logger.info(f"[INGEST] Extracted {len(docs)} document(s)")
 
-        logger.info("[INGEST] Calling extract()...")
-        docs = extract(file_path)
+    # 2. Chunk
+    logger.info("[INGEST] Step 2: Chunking...")
+    chunks = chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    if not chunks:
+        raise ValueError("Chunking returned nothing")
+    doc_id = chunks[0]["doc_id"]
+    logger.info(f"[INGEST] {len(chunks)} chunks, doc_id: {doc_id}")
 
-        if not docs:
-            raise Exception("Extraction returned no documents")
+    # 3. Store chunks in Neo4j
+    logger.info("[INGEST] Step 3: Storing chunks...")
+    graphdb.store_chunks(chunks)
 
-        logger.info(f"[INGEST] Extracted {len(docs)} documents")
+    # 4. Extract entities and relationships
+    logger.info("[INGEST] Step 4: Extracting graph (this may take a while)...")
+    entities, relationships = extract_graph_from_chunks(chunks, model=extract_model)
+    logger.info(f"[INGEST] Found {len(entities)} entities, {len(relationships)} relationships")
 
-        # Add metadata to documents
-        for d in docs:
-            d.metadata["doc_id"] = doc_id
-            d.metadata["file_name"] = file_path
-            logger.debug(f"[INGEST] Document metadata: {d.metadata}")
-
-        logger.info("[INGEST] Splitting documents into nodes...")
-        parser = SentenceSplitter(
-            chunk_size=256,
-            chunk_overlap=32
-        )
-
-        nodes = parser.get_nodes_from_documents(docs)
-        logger.info(f"[INGEST] Parsed {len(nodes)} nodes")
-
-        if not nodes:
-            logger.error("[INGEST] Node parsing returned no nodes!")
-            raise Exception("Node parsing returned no nodes")
-
-        # Log sample nodes
-        for i, node in enumerate(nodes[:2]):
-            logger.debug(f"[INGEST] Sample node {i}: {node.text[:100]}... | metadata: {node.metadata}")
-
-        logger.info(f"[INGEST] Ingesting {len(nodes)} nodes into Neo4j...")
-        graphdb.create_index(nodes)
-
-        # Verify data was written
-        logger.info("[INGEST] Verifying data was written to Neo4j...")
-        nodes_in_db = graphdb._verify_data_in_neo4j()
-        logger.info(f"[INGEST] Nodes now in Neo4j: {nodes_in_db}")
-        
-        if nodes_in_db == 0:
-            logger.warning("[INGEST] ⚠ WARNING: No nodes found in Neo4j after ingestion!")
-            logger.warning("[INGEST] PropertyGraphIndex may not have persisted data automatically")
-            logger.warning("[INGEST] This could be a LlamaIndex bug - trying manual insertion...")
-
-        logger.info(f"[INGEST] Ingestion complete! doc_id: {doc_id}")
+    if not entities:
+        logger.warning("[INGEST] No entities extracted — graph will be empty")
         return doc_id
 
-    except Exception as e:
-        logger.error(f"[INGEST] Ingestion failed: {str(e)}", exc_info=True)
-        raise
+    # 5. Store entities and relationships
+    logger.info("[INGEST] Step 5: Storing graph in Neo4j...")
+    graphdb.store_entities(entities)
+    graphdb.store_relationships(relationships)
+
+    # 6. Community detection and summarization
+    logger.info("[INGEST] Step 6: Community detection...")
+    communities = run_community_detection(
+        entities, relationships, summary_model=summary_model
+    )
+    if communities:
+        graphdb.store_communities(communities)
+        logger.info(f"[INGEST] {len(communities)} communities stored")
+    else:
+        logger.info("[INGEST] No communities detected (graph may be too sparse)")
+
+    # 7. Stats
+    stats = graphdb.stats()
+    logger.info(f"[INGEST] Final graph stats: {stats}")
+    logger.info(f"[INGEST] Done! doc_id: {doc_id}")
+    logger.info("=" * 60)
+
+    return doc_id

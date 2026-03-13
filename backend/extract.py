@@ -1,158 +1,184 @@
+"""
+backend/extract.py
+Multimodal file extraction — image, audio, text.
+Returns raw text strings (not LlamaIndex Documents).
+"""
+
 import os
 import logging
-from typing import List
-
-from llama_index.core.llms import ChatMessage, TextBlock, ImageBlock
-from llama_index.llms.ollama import Ollama
-from llama_index.core.schema import Document
-from llama_index.core import SimpleDirectoryReader
-
-from faster_whisper import WhisperModel
+import json
+import requests
+from typing import List, Dict
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
 
-def extract_image(image_path: str) -> List[Document]:
+
+def _ollama_chat(model: str, messages: list, timeout: int = 120) -> str:
+    """Direct Ollama API call — no LlamaIndex dependency."""
+    resp = requests.post(
+        "http://localhost:11434/api/chat",
+        json={"model": model, "messages": messages, "stream": False},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
+def _ollama_vision(model: str, prompt: str, image_path: str, timeout: int = 180) -> str:
+    """Ollama vision call with base64 image."""
+    import base64
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    resp = requests.post(
+        "http://localhost:11434/api/chat",
+        json={
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt, "images": [img_b64]}
+            ],
+            "stream": False,
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
+# ── Extractors ──────────────────────────────────────────────────────
+
+def extract_image(path: str) -> List[Dict]:
+    logger.info(f"[EXTRACT] Image: {path}")
+    prompt = (
+        "Describe this image in detailed text so someone can fully understand it.\n"
+        "If it contains readable text, reproduce it exactly.\n"
+        "If it has diagrams, tables, or charts, describe their structure."
+    )
+    text = _ollama_vision("qwen3-vl:4b", prompt, path)
+    return [{"text": text.strip(), "source": path, "type": "image"}]
+
+
+def extract_audio(path: str) -> List[Dict]:
     """
-    Extract detailed textual description from an image using a vision model.
+    Transcribe audio using Moonshine (CPU, no CUDA needed).
+    Supports .wav natively. For .mp3/.m4a/.flac, converts to wav first via ffmpeg.
     """
-    logger.info(f"[EXTRACT] Starting image extraction: {image_path}")
+    logger.info(f"[EXTRACT] Audio: {path}")
+    import subprocess, tempfile
+
+    ext = os.path.splitext(path)[1].lower()
+    wav_path = path
+
+    # Moonshine expects wav — convert other formats via ffmpeg
+    if ext != ".wav":
+        logger.info(f"[EXTRACT] Converting {ext} to wav via ffmpeg...")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        wav_path = tmp.name
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", path, "-ar", "16000", "-ac", "1", wav_path],
+                capture_output=True, check=True,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "ffmpeg not found. Install it: https://ffmpeg.org/download.html"
+            )
 
     try:
-        llm = Ollama(
-            model="qwen3-vl:4b",
-            request_timeout=120.0,
-            context_window=8000,
+        from moonshine_voice import (
+            Transcriber, TranscriptEventListener,
+            get_model_for_language, load_wav_file,
         )
 
-        messages = [
-            ChatMessage(
-                role="user",
-                blocks=[
-                    TextBlock(
-                        text=(
-                            "Describe this image in very detailed text so that someone "
-                            "can fully understand the image without seeing it.\n\n"
-                            "If the image contains any readable text, reproduce the text "
-                            "exactly as written.\n\n"
-                            "If the image contains diagrams, tables, charts, UI elements, "
-                            "or structured layouts, describe their structure clearly in text."
-                        )
-                    ),
-                    ImageBlock(path=image_path),
-                ],
-            ),
-        ]
+        model_path, model_arch = get_model_for_language("en")
+        transcriber = Transcriber(model_path=model_path, model_arch=model_arch)
+        stream = transcriber.create_stream(update_interval=0.5)
 
-        resp = llm.chat(messages)
-        logger.debug(f"[EXTRACT] Image LLM response: {len(resp.text)} chars")
+        # Collect completed lines
+        lines = []
 
-        doc = Document(
-            text=resp.text.strip(),
-            metadata={
-                "source": image_path,
-                "type": "image",
-            },
-        )
+        class FileListener(TranscriptEventListener):
+            def on_line_completed(self, event):
+                lines.append(event.line.text)
 
-        logger.info(f"[EXTRACT] Image extraction successful: 1 document")
-        return [doc]
-    except Exception as e:
-        logger.error(f"[EXTRACT] Image extraction failed: {str(e)}", exc_info=True)
-        raise
+        stream.add_listener(FileListener())
+        stream.start()
+
+        # Feed audio in chunks
+        audio_data, sample_rate = load_wav_file(wav_path)
+        chunk_size = int(0.5 * sample_rate)  # 500ms chunks
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i : i + chunk_size]
+            stream.add_audio(chunk, sample_rate)
+
+        stream.stop()
+        transcriber.stop()
+        transcript = " ".join(lines).strip()
+
+    except ImportError:
+        # Fallback: try the simpler useful-moonshine-onnx package
+        logger.info("[EXTRACT] moonshine-voice not found, trying useful-moonshine-onnx...")
+        try:
+            from moonshine_onnx import MoonshineOnnxModel, load_audio
+            model = MoonshineOnnxModel(model_name="moonshine/base")
+            audio = load_audio(wav_path)
+            tokens = model.generate(audio)
+            transcript = model.tokenizer.decode_batch(tokens)[0]
+        except ImportError:
+            raise ImportError(
+                "No audio transcription library found. Install one:\n"
+                "  pip install moonshine-voice\n"
+                "  pip install useful-moonshine-onnx"
+            )
+    finally:
+        # Clean up temp wav if we created one
+        if wav_path != path and os.path.exists(wav_path):
+            os.unlink(wav_path)
+
+    logger.info(f"[EXTRACT] Transcribed {len(transcript)} chars")
+    return [{"text": transcript, "source": path, "type": "audio"}]
 
 
-def extract_audio(audio_path: str) -> List[Document]:
+def extract_text(path: str) -> List[Dict]:
     """
-    Transcribe audio using Faster-Whisper
+    Extract text from documents using LlamaIndex's SimpleDirectoryReader.
+    Supports: .pdf, .txt, .md, .csv, .docx, .pptx, .epub, .html, .xlsx, and more.
     """
-    logger.info(f"[EXTRACT] Starting audio extraction: {audio_path}")
+    logger.info(f"[EXTRACT] Text: {path}")
 
-    try:
-        # CPU version 
-        # model = WhisperModel(
-        #     "base",
-        #     device="cpu",
-        #     compute_type="int8"
-        # )
+    from llama_index.core import SimpleDirectoryReader
 
-        # GPU version 
-        model = WhisperModel(
-            "base",
-            device="cuda",
-            compute_type="float16"
-        )
+    docs = SimpleDirectoryReader(input_files=[path]).load_data()
 
-        segments, _ = model.transcribe(audio_path)
-        logger.debug(f"[EXTRACT] Audio transcribed with {len(list(segments))} segments")
+    results = []
+    for doc in docs:
+        text = doc.text.strip()
+        if text:
+            results.append({
+                "text": text,
+                "source": path,
+                "type": "document",
+            })
 
-        transcript = ""
+    if not results:
+        raise ValueError(f"No text extracted from {path}")
 
-        for seg in segments:
-            transcript += seg.text + " "
-
-        logger.debug(f"[EXTRACT] Total transcript length: {len(transcript)} chars")
-
-        doc = Document(
-            text=transcript.strip(),
-            metadata={
-                "source": audio_path,
-                "type": "audio",
-            },
-        )
-
-        logger.info(f"[EXTRACT] Audio extraction successful: 1 document")
-        return [doc]
-    except Exception as e:
-        logger.error(f"[EXTRACT] Audio extraction failed: {str(e)}", exc_info=True)
-        raise
+    logger.info(f"[EXTRACT] LlamaIndex extracted {len(results)} document(s)")
+    return results
 
 
-def extract_text(file_path: str) -> List[Document]:
-    """
-    Extract text from standard document formats using LlamaIndex readers
-    """
-    logger.info(f"[EXTRACT] Starting text extraction: {file_path}")
-
-    try:
-        docs = SimpleDirectoryReader(
-            input_files=[file_path]
-        ).load_data()
-
-        logger.debug(f"[EXTRACT] Loaded {len(docs)} documents from file")
-
-        for d in docs:
-            d.metadata["source"] = file_path
-            d.metadata["type"] = "document"
-
-        logger.info(f"[EXTRACT] Text extraction successful: {len(docs)} documents")
-        return docs
-    except Exception as e:
-        logger.error(f"[EXTRACT] Text extraction failed: {str(e)}", exc_info=True)
-        raise
-
-
-def extract(file_path: str) -> List[Document]:
-    """
-    Detect file type and route to correct extractor
-    """
-    logger.info(f"[EXTRACT] Starting extraction for: {file_path}")
-
+def extract(file_path: str) -> List[Dict]:
+    """Route to correct extractor based on extension."""
     ext = os.path.splitext(file_path)[1].lower()
-    logger.debug(f"[EXTRACT] Detected file extension: {ext}")
 
-    try:
-        if ext in [".png", ".jpg", ".jpeg"]:
-            result = extract_image(file_path)
-        elif ext in [".wav", ".mp3", ".m4a", ".flac"]:
-            result = extract_audio(file_path)
-        elif ext in [".pdf", ".txt", ".docx", ".csv", ".xlsx", ".md"]:
-            result = extract_text(file_path)
-        else:
-            raise ValueError(f"Unsupported file type: {ext}")
-        
-        logger.info(f"[EXTRACT] Extraction complete: {len(result)} documents returned")
-        return result
-    except Exception as e:
-        logger.error(f"[EXTRACT] Extraction failed: {str(e)}", exc_info=True)
-        raise
+    if ext in (".png", ".jpg", ".jpeg", ".webp"):
+        return extract_image(file_path)
+    elif ext in (".wav", ".mp3", ".m4a", ".flac"):
+        return extract_audio(file_path)
+    else:
+        # Everything else goes through LlamaIndex's SimpleDirectoryReader
+        # which handles: .pdf, .txt, .md, .csv, .docx, .pptx, .epub,
+        # .html, .xlsx, .json, .ipynb, and more
+        return extract_text(file_path)

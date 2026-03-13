@@ -1,283 +1,316 @@
-import asyncio
-import sys
+"""
+graphdb/model.py
+Neo4j graph database manager.
+Stores entities, relationships, chunks, and community summaries.
+"""
+
 import logging
-import nest_asyncio
+from typing import List, Dict, Optional
 
-# Fix for Python 3.13 + Windows: patch event loop to never close mid-run
-nest_asyncio.apply()
+from neo4j import GraphDatabase
+import os
+from dotenv import load_dotenv
+from pathlib import Path
 
-from llama_index.core import Settings, StorageContext
-from llama_index.core.indices.property_graph import PropertyGraphIndex
-from llama_index.core.indices.property_graph import SimpleLLMPathExtractor
-
-from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.ollama import OllamaEmbedding
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
-
-Settings.num_workers = 1
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 class GraphDB:
 
-    def __init__(self):
-        logger.info("[GraphDB] Initializing GraphDB connection...")
+    def __init__(
+        self,
+        uri: str = os.getenv("NEO4J_URI"),
+        user: str = os.getenv("NEO4J_USER"),
+        password: str = os.getenv("NEO4J_PASSWORD"),
+    ):
+        logger.info("[GraphDB] Connecting to Neo4j...")
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        self.driver.verify_connectivity()
+        self._ensure_indexes()
+        logger.info("[GraphDB] Connected and indexes ensured")
 
-        try:
-            # Neo4j connection
-            self.graph_store = Neo4jPropertyGraphStore(
-                username="neo4j",
-                password="qwerty123456",
-                url="neo4j://127.0.0.1:7687",
-            )
-            logger.info("[GraphDB] Neo4j connection established")
+    def _ensure_indexes(self):
+        """Create indexes for fast lookups."""
+        with self.driver.session() as s:
+            s.run("CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)")
+            s.run("CREATE INDEX chunk_id IF NOT EXISTS FOR (c:Chunk) ON (c.chunk_id)")
+            s.run("CREATE INDEX community_id IF NOT EXISTS FOR (c:Community) ON (c.community_id)")
+            s.run("CREATE INDEX doc_id_idx IF NOT EXISTS FOR (c:Chunk) ON (c.doc_id)")
 
+    # ── Write operations ────────────────────────────────────────────
 
-            # LLM for querying
-            self.llm = Ollama(
-                model="qwen3-small-ctx",
-                base_url="http://localhost:11434",
-                request_timeout=600,
-                temperature=0,
-                json_mode=False,
-                context_window=2048,
-                additional_kwargs={"options": {"num_ctx": 2048}}
-            )
-            logger.info("[GraphDB] Query LLM initialized")
+    def store_chunks(self, chunks: List[Dict]):
+        """Store text chunks as Chunk nodes."""
+        logger.info(f"[GraphDB] Storing {len(chunks)} chunks...")
+        query = """
+        UNWIND $chunks AS c
+        MERGE (chunk:Chunk {chunk_id: c.chunk_id})
+        SET chunk.text = c.text,
+            chunk.source = c.source,
+            chunk.type = c.type,
+            chunk.doc_id = c.doc_id,
+            chunk.chunk_index = c.chunk_index
+        """
+        with self.driver.session() as s:
+            s.run(query, chunks=chunks)
+        logger.info(f"[GraphDB] Chunks stored")
 
-            # Faster LLM for graph extraction
-            self.extract_llm = Ollama(
-                model="phi3-small-ctx",
-                base_url="http://localhost:11434",
-                request_timeout=600,
-                temperature=0,
-                json_mode=False,
-                context_window=2048,
-                additional_kwargs={"options": {"num_ctx": 2048}}
-            )
-            logger.info("[GraphDb] Extraction LLM initialized")
+    def store_entities(self, entities: List[Dict]):
+        """Store entities as Entity nodes."""
+        logger.info(f"[GraphDB] Storing {len(entities)} entities...")
+        query = """
+        UNWIND $entities AS e
+        MERGE (ent:Entity {name: e.name})
+        SET ent.type = e.type,
+            ent.description = e.description
+        """
+        with self.driver.session() as s:
+            s.run(query, entities=entities)
 
-            self.kg_extractors = [
-                SimpleLLMPathExtractor(
-                    llm=self.extract_llm,
-                    max_paths_per_chunk=3,
-                    num_workers=1,
-                )
-            ]
-            logger.info("[GraphDB] KG extractors configured")
+        # Link entities to their source chunks
+        link_query = """
+        UNWIND $entities AS e
+        UNWIND e.chunk_ids AS cid
+        MATCH (ent:Entity {name: e.name})
+        MATCH (chunk:Chunk {chunk_id: cid})
+        MERGE (ent)-[:MENTIONED_IN]->(chunk)
+        """
+        with self.driver.session() as s:
+            s.run(link_query, entities=entities)
 
-            # Embedding model
-            self.embed_model = OllamaEmbedding(
-                model_name="qwen3-embedding:4b",
-                base_url="http://localhost:11434",
-                ollama_additional_kwargs={"options": {"num_ctx": 512}}
-            )
-            logger.info("[GraphDB] Embedding model initialized")
+        logger.info(f"[GraphDB] Entities stored and linked to chunks")
 
-            Settings.llm = self.llm
-            Settings.embed_model = self.embed_model
+    def store_relationships(self, relationships: List[Dict]):
+        """Store relationships as edges between entities."""
+        logger.info(f"[GraphDB] Storing {len(relationships)} relationships...")
+        # Neo4j doesn't allow parameterized relationship types in MERGE,
+        # so we use APOC or a generic edge with a 'type' property
+        query = """
+        UNWIND $rels AS r
+        MATCH (src:Entity {name: r.source})
+        MATCH (tgt:Entity {name: r.target})
+        MERGE (src)-[rel:RELATES_TO {relation: r.relation}]->(tgt)
+        SET rel.description = r.description,
+            rel.chunk_id = r.chunk_id
+        """
+        with self.driver.session() as s:
+            s.run(query, rels=relationships)
+        logger.info(f"[GraphDB] Relationships stored")
 
-            self.index = None
-            logger.info("[GraphDB] GraphDB initialization complete")
-        except Exception as e:
-            logger.error(f"[GraphDB] Initialization failed: {str(e)}", exc_info=True)
-            raise
+    def store_communities(self, communities: List[Dict]):
+        """
+        Store community detection results.
+        Each community has: community_id, level, member_entities, summary
+        """
+        logger.info(f"[GraphDB] Storing {len(communities)} communities...")
+        query = """
+        UNWIND $comms AS c
+        MERGE (comm:Community {community_id: c.community_id})
+        SET comm.level = c.level,
+            comm.summary = c.summary,
+            comm.member_count = c.member_count
+        """
+        with self.driver.session() as s:
+            s.run(query, comms=communities)
 
-    def create_index(self, nodes):
-        """Build index and persist to Neo4j"""
-        logger.info(f"[GraphDB] Starting index creation with {len(nodes)} nodes")
+        # Link entities to communities
+        link_query = """
+        UNWIND $comms AS c
+        UNWIND c.members AS member_name
+        MATCH (comm:Community {community_id: c.community_id})
+        MATCH (ent:Entity {name: member_name})
+        MERGE (ent)-[:BELONGS_TO]->(comm)
+        """
+        with self.driver.session() as s:
+            s.run(link_query, comms=communities)
 
-        try:
-            # Storage context must be created fresh each time for Neo4j writes
-            storage_context = StorageContext.from_defaults(
-                graph_store=self.graph_store
-            )
-            logger.debug("[GraphDB] Storage context created")
+        logger.info(f"[GraphDB] Communities stored and linked")
 
-            logger.info("[GraphDB] Building PropertyGraphIndex (this extracts KG from nodes)...")
-            self.index = PropertyGraphIndex(
-                nodes=nodes,
-                storage_context=storage_context,
-                kg_extractors=self.kg_extractors,
-                show_progress=True,
-            )
-            logger.info("[GraphDB] PropertyGraphIndex construction complete")
-            
-            # Try to force refresh schema to persist
-            logger.info("[GraphDB] Attempting to refresh schema...")
-            try:
-                self.graph_store.refresh_schema()
-                logger.info("[GraphDB] Schema refreshed")
-            except Exception as e:
-                logger.warning(f"[GraphDB] Schema refresh failed: {str(e)}")
-            
-            # Verify data was written to Neo4j
-            nodes_in_db = self._verify_data_in_neo4j()
-            
-            # If no nodes were persisted, try manual insertion as fallback
-            if nodes_in_db == 0:
-                logger.warning("[GraphDB] ⚠ PropertyGraphIndex did not persist data!")
-                logger.info("[GraphDB] Attempting manual node insertion as fallback...")
-                self._manual_insert_nodes(nodes)
-                
-                # Verify again
-                nodes_in_db = self._verify_data_in_neo4j()
-                if nodes_in_db > 0:
-                    logger.info("[GraphDB] ✓ Manual insertion successful!")
-                else:
-                    logger.error("[GraphDB] ✗ Manual insertion also failed - no nodes in database")
+    # ── Read operations ─────────────────────────────────────────────
 
-            return self.index
-        except Exception as e:
-            logger.error(f"[GraphDB] Index creation failed: {str(e)}", exc_info=True)
-            raise
+    def get_entity_neighborhood(self, entity_name: str, hops: int = 2) -> Dict:
+        """
+        Get an entity and its local neighborhood (entities + relationships).
+        This is the 'local search' in GraphRAG.
+        """
+        # Get neighbors and relationships using simple 1-hop matches
+        # then union for multi-hop — avoids variable-length path issues
+        rel_query = """
+        MATCH (e:Entity {name: $name})-[r:RELATES_TO]-(neighbor:Entity)
+        RETURN neighbor.name AS neighbor_name, neighbor.type AS neighbor_type,
+               neighbor.description AS neighbor_desc,
+               startNode(r).name AS source, endNode(r).name AS target,
+               r.relation AS relation, r.description AS rel_desc
+        """
+        neighbors = []
+        rels = []
+        seen_neighbors = set()
+        seen_rels = set()
 
-    def _verify_data_in_neo4j(self):
-        """Direct query to verify what's actually in Neo4j after write"""
-        logger.info("[GraphDB] Verifying data in Neo4j...")
-        
-        try:
-            with self.graph_store._driver.session() as session:
-                # Check total nodes
-                result = session.run("MATCH (n) RETURN count(n) as total")
-                total_nodes = result.single()["total"]
-                logger.info(f"[GraphDB] Total nodes in Neo4j: {total_nodes}")
+        with self.driver.session() as s:
+            # First hop
+            result = s.run(rel_query, name=entity_name)
+            for r in result:
+                n_name = r["neighbor_name"]
+                if n_name not in seen_neighbors:
+                    seen_neighbors.add(n_name)
+                    neighbors.append({
+                        "name": n_name, "type": r["neighbor_type"],
+                        "description": r["neighbor_desc"],
+                    })
+                rel_key = (r["source"], r["target"], r["relation"])
+                if rel_key not in seen_rels:
+                    seen_rels.add(rel_key)
+                    rels.append({
+                        "source": r["source"], "target": r["target"],
+                        "relation": r["relation"], "description": r["rel_desc"],
+                    })
 
-                # Check all labels and counts
-                result = session.run("MATCH (n) RETURN labels(n) as labels, count(n) as cnt")
-                node_types = [(r["labels"], r["cnt"]) for r in result]
-                if node_types:
-                    logger.info("[GraphDB] Node types:")
-                    for labels, cnt in node_types:
-                        logger.info(f"  {labels}: {cnt}")
-                else:
-                    logger.warning("[GraphDB] No node types found!")
+            # Second hop (if requested)
+            if hops >= 2:
+                for n_name in list(seen_neighbors):
+                    result = s.run(rel_query, name=n_name)
+                    for r in result:
+                        nn = r["neighbor_name"]
+                        if nn not in seen_neighbors and nn != entity_name:
+                            seen_neighbors.add(nn)
+                            neighbors.append({
+                                "name": nn, "type": r["neighbor_type"],
+                                "description": r["neighbor_desc"],
+                            })
+                        rel_key = (r["source"], r["target"], r["relation"])
+                        if rel_key not in seen_rels:
+                            seen_rels.add(rel_key)
+                            rels.append({
+                                "source": r["source"], "target": r["target"],
+                                "relation": r["relation"], "description": r["rel_desc"],
+                            })
 
-                # Check all property keys that exist
-                result = session.run("MATCH (n) UNWIND keys(n) as k RETURN DISTINCT k")
-                props = [r["k"] for r in result]
-                logger.info(f"[GraphDB] Properties in nodes: {props}")
+        # Fetch associated chunks
+        chunk_query = """
+        MATCH (e:Entity {name: $name})-[:MENTIONED_IN]->(c:Chunk)
+        RETURN c.text AS text, c.source AS source
+        LIMIT 5
+        """
+        with self.driver.session() as s:
+            result = s.run(chunk_query, name=entity_name)
+            chunks = [{"text": r["text"], "source": r["source"]} for r in result]
 
-                # Sample a node
-                result = session.run("MATCH (n) RETURN n LIMIT 1")
-                record = result.single()
-                if record:
-                    logger.debug(f"[GraphDB] Sample node: {dict(record['n'])}")
-                else:
-                    logger.warning("[GraphDB] No nodes found in database!")
-                    
-                return total_nodes
-                    
-        except Exception as e:
-            logger.error(f"[GraphDB] Verification query failed: {str(e)}", exc_info=True)
-            return 0
+        return {
+            "entity": entity_name,
+            "neighbors": neighbors,
+            "relationships": rels,
+            "chunks": chunks,
+        }
 
-    def _manual_insert_nodes(self, nodes):
-        """Fallback: manually insert nodes to Neo4j using raw driver if PropertyGraphIndex didn't persist them"""
-        logger.info(f"[GraphDB] Attempting manual insertion of {len(nodes)} nodes using raw driver...")
-        
-        inserted_count = 0
-        try:
-            with self.graph_store._driver.session() as session:
-                for i, node in enumerate(nodes):
-                    try:
-                        # Create __Node__ in Neo4j with node properties
-                        node_id = node.node_id or f"node_{i}"
-                        node_text = node.get_content()[:500] if hasattr(node, 'get_content') else str(node.text)[:500]
-                        
-                        # Use raw Cypher to create node
-                        query = """
-                        CREATE (n:__Node__ {
-                            id: $node_id,
-                            text: $node_text,
-                            created_at: datetime()
-                        })
-                        """
-                        session.run(query, node_id=node_id, node_text=node_text)
-                        inserted_count += 1
-                        
-                        if (i + 1) % 5 == 0 or (i + 1) == len(nodes):
-                            logger.debug(f"[GraphDB] Raw insert: {i + 1}/{len(nodes)} nodes created in transaction")
-                    except Exception as e:
-                        logger.warning(f"[GraphDB] Failed to insert node {i} ({node.node_id}): {str(e)}")
-            
-            logger.info(f"[GraphDB] Manual insertion completed: {inserted_count}/{len(nodes)} nodes created in Neo4j")
-            
-        except Exception as e:
-            logger.error(f"[GraphDB] Manual insertion failed: {str(e)}", exc_info=True)
+    def get_community_summaries(self, entity_name: Optional[str] = None) -> List[Dict]:
+        """
+        Get community summaries — either all (global search) or
+        those relevant to a specific entity (local+global).
+        """
+        if entity_name:
+            query = """
+            MATCH (e:Entity {name: $name})-[:BELONGS_TO]->(c:Community)
+            RETURN c.community_id AS id, c.summary AS summary, c.level AS level,
+                   c.member_count AS member_count
+            ORDER BY c.level
+            """
+            with self.driver.session() as s:
+                result = s.run(query, name=entity_name)
+                return [dict(r) for r in result]
+        else:
+            query = """
+            MATCH (c:Community)
+            RETURN c.community_id AS id, c.summary AS summary, c.level AS level,
+                   c.member_count AS member_count
+            ORDER BY c.level, c.member_count DESC
+            """
+            with self.driver.session() as s:
+                result = s.run(query)
+                return [dict(r) for r in result]
 
-    def load_index(self):
-        """Load existing graph from Neo4j"""
-        logger.info("[GraphDB] Loading index from existing Neo4j graph...")
-        
-        try:
-            self.index = PropertyGraphIndex.from_existing(
-                property_graph_store=self.graph_store,
-                llm=self.llm,
-                embed_model=self.embed_model,
-            )
-            logger.info("[GraphDB] Index loaded successfully")
-            return self.index
-        except Exception as e:
-            logger.error(f"[GraphDB] Load index failed: {str(e)}", exc_info=True)
-            raise
+    def search_entities(self, search_term: str, limit: int = 10) -> List[Dict]:
+        """Fuzzy search for entities by name."""
+        cypher = """
+        MATCH (e:Entity)
+        WHERE toLower(e.name) CONTAINS toLower($term)
+        RETURN e.name AS name, e.type AS type, e.description AS description
+        ORDER BY size(e.name)
+        LIMIT $lim
+        """
+        with self.driver.session() as s:
+            result = s.run(cypher, term=search_term, lim=limit)
+            return [dict(r) for r in result]
 
-    def get_retriever(self):
-        logger.debug("[GraphDB] Getting retriever...")
+    def get_all_entities_and_rels(self) -> Dict:
+        """Export full graph as NetworkX-compatible edge list."""
+        entity_query = "MATCH (e:Entity) RETURN e.name AS name, e.type AS type"
+        rel_query = """
+        MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+        RETURN a.name AS source, b.name AS target, r.relation AS relation
+        """
+        with self.driver.session() as s:
+            entities = [dict(r) for r in s.run(entity_query)]
+            rels = [dict(r) for r in s.run(rel_query)]
+        return {"entities": entities, "relationships": rels}
 
-        if self.index is None:
-            self.load_index()
+    # ── Management ──────────────────────────────────────────────────
 
-        return self.index.as_retriever(include_text=True)
-
-    def clear_graph(self):
-        logger.warning("[GraphDB] Clearing entire graph from Neo4j...")
-        
-        try:
-            with self.graph_store._driver.session() as session:
-                result = session.run("MATCH (n) DETACH DELETE n")
-                logger.info("[GraphDB] Graph cleared")
-        except Exception as e:
-            logger.error(f"[GraphDB] Clear graph failed: {str(e)}", exc_info=True)
-            raise
+    def list_documents(self) -> List[Dict]:
+        query = """
+        MATCH (c:Chunk)
+        WHERE c.doc_id IS NOT NULL
+        RETURN DISTINCT c.doc_id AS doc_id, c.source AS source
+        LIMIT 100
+        """
+        with self.driver.session() as s:
+            return [dict(r) for r in s.run(query)]
 
     def delete_document(self, doc_id: str):
+        """Delete all chunks, orphaned entities, and communities for a document."""
         logger.info(f"[GraphDB] Deleting document: {doc_id}")
-        
-        try:
-            with self.graph_store._driver.session() as session:
-                result = session.run(
-                    "MATCH (n) WHERE n.doc_id = $doc_id DETACH DELETE n",
-                    doc_id=doc_id
-                )
-                logger.info(f"[GraphDB] Document {doc_id} deleted")
-        except Exception as e:
-            logger.error(f"[GraphDB] Delete document failed: {str(e)}", exc_info=True)
-            raise
+        with self.driver.session() as s:
+            # Delete chunks
+            s.run("MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c", doc_id=doc_id)
+            # Clean orphaned entities (no remaining chunk links)
+            s.run("""
+                MATCH (e:Entity)
+                WHERE NOT (e)-[:MENTIONED_IN]->(:Chunk)
+                DETACH DELETE e
+            """)
+            # Clean orphaned communities
+            s.run("""
+                MATCH (c:Community)
+                WHERE NOT (:Entity)-[:BELONGS_TO]->(c)
+                DELETE c
+            """)
+        logger.info(f"[GraphDB] Document {doc_id} and orphans cleaned")
 
-    def list_documents(self):
-        logger.debug("[GraphDB] Listing documents...")
-        
-        try:
-            # Use filename property since that's what Neo4j actually stores
-            query = """
-            MATCH (n)
-            WHERE n.filename IS NOT NULL
-            RETURN DISTINCT n.id AS doc_id, n.filename AS file
-            LIMIT 100
-            """
+    def clear_graph(self):
+        logger.warning("[GraphDB] Clearing entire graph...")
+        with self.driver.session() as s:
+            s.run("MATCH (n) DETACH DELETE n")
+        logger.info("[GraphDB] Graph cleared")
 
-            with self.graph_store._driver.session() as session:
-                result = session.run(query)
-                docs = [{"doc_id": r["doc_id"], "file": r["file"]} for r in result]
-                logger.debug(f"[GraphDB] Found {len(docs)} documents")
-                return docs
-        except Exception as e:
-            logger.error(f"[GraphDB] List documents failed: {str(e)}", exc_info=True)
-            return []
+    def stats(self) -> Dict:
+        """Quick stats about the graph."""
+        with self.driver.session() as s:
+            entities = s.run("MATCH (e:Entity) RETURN count(e) AS c").single()["c"]
+            chunks = s.run("MATCH (c:Chunk) RETURN count(c) AS c").single()["c"]
+            rels = s.run("MATCH ()-[r:RELATES_TO]->() RETURN count(r) AS c").single()["c"]
+            communities = s.run("MATCH (c:Community) RETURN count(c) AS c").single()["c"]
+        return {
+            "entities": entities,
+            "chunks": chunks,
+            "relationships": rels,
+            "communities": communities,
+        }
+
+    def close(self):
+        self.driver.close()
 
 
-# Singleton instance
+# Singleton
 graphdb = GraphDB()
