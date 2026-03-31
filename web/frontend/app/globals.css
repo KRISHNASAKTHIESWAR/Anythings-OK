@@ -1,0 +1,108 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Light mode — always the hard default on :root ─────────────── */
+/* Theme switching is done exclusively via [data-theme] attribute.  */
+/* The inline script in layout.tsx runs before first paint to avoid */
+/* any flash of wrong theme.                                        */
+:root,
+[data-theme="light"] {
+  --bg-primary: #f8f7f4;
+  --bg-secondary: #f0ede8;
+  --bg-sidebar: #eeebe5;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f3f0eb;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-bright: rgba(210, 143, 75, 0.5);
+  --accent: #d97706;
+  --accent-2: #7c3aed;
+  --text-primary: #1a1814;
+  --text-secondary: #5c5650;
+  --text-muted: #a09a92;
+  --input-bg: #ffffff;
+  --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,0.08);
+}
+
+/* ── Dark mode ──────────────────────────────────────────────────── */
+[data-theme="dark"] {
+  --bg-primary: #0e0e10;
+  --bg-secondary: #141416;
+  --bg-sidebar: #111113;
+  --bg-card: #1a1a1d;
+  --bg-card-hover: #222226;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-bright: rgba(210, 143, 75, 0.4);
+  --accent: #e8952a;
+  --accent-2: #a78bfa;
+  --text-primary: #eeece8;
+  --text-secondary: #9b9790;
+  --text-muted: #504c47;
+  --input-bg: #1a1a1d;
+  --shadow: 0 1px 3px rgba(0,0,0,0.4);
+  --shadow-lg: 0 4px 20px rgba(0,0,0,0.4);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Plus Jakarta Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--text-muted); border-radius: 4px; opacity: 0.5; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* Typing cursor */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.cursor-blink::after {
+  content: '|';
+  animation: blink 1s step-end infinite;
+  color: var(--accent);
+  margin-left: 1px;
+}
+
+/* Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* Animations */
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.slide-up { animation: slideUp 0.25s ease-out; }
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.fade-in { animation: fadeIn 0.3s ease-out; }
